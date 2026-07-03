@@ -1,0 +1,13 @@
+name: ltm
+version: 1.0.0
+description: >
+  Labo LTM MemoryProvider — Granite-97m ONNX embeddings + SQLite-vec.
+  Subprocess-isolated (runs in ltm-env venv), fully local, zero external
+  dependencies. Provides automatic recall via prefetch, semantic search via
+  ltm_search tool, fact extraction on_pre_compress and on_session_end, and
+  mirrors built-in memory writes to the LTM SQLite database.
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_session_switch
