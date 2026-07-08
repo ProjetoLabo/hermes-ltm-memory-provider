@@ -297,7 +297,7 @@ class LTMMemoryProvider:
         """Queue a background Granite ONNX search for the next turn."""
         if not self._auto_recall:
             return
-        if not query or len(query.strip()) < 3 or not self._is_alive():
+        if not query or len(query.strip()) < 3 or not self._ensure_alive():
             return
 
         def _do_prefetch():
@@ -382,7 +382,7 @@ class LTMMemoryProvider:
         if not query or len(query.strip()) < 2:
             return json.dumps({"error": "query is required and must be at least 2 characters"})
 
-        if not self._is_alive():
+        if not self._ensure_alive():
             return json.dumps({"error": "LTM subprocess is not running"})
 
         result = self._send({
@@ -429,7 +429,7 @@ class LTMMemoryProvider:
         if len(content) < 10:
             return json.dumps({"error": "content too short (minimum 10 characters)"})
 
-        if not self._is_alive():
+        if not self._ensure_alive():
             return json.dumps({"error": "LTM subprocess is not running"})
 
         result = self._send({
@@ -451,7 +451,7 @@ class LTMMemoryProvider:
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Save conversation about to be discarded, return text for compression LLM."""
-        if not messages or not self._is_alive():
+        if not messages or not self._ensure_alive():
             return ""
 
         # Extract user + assistant messages
@@ -483,7 +483,7 @@ class LTMMemoryProvider:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Save remaining conversation to LTM and export to Obsidian if needed."""
-        if not self._is_alive():
+        if not self._ensure_alive():
             return
 
         # Skip empty sessions
@@ -537,7 +537,7 @@ class LTMMemoryProvider:
         """Mirror built-in memory writes to LTM."""
         if action != "add" or not content or len(content) < 10:
             return
-        if not self._is_alive():
+        if not self._ensure_alive():
             return
 
         category = "config" if target == "user" else "geral"
@@ -575,7 +575,7 @@ class LTMMemoryProvider:
         """Handle session switches — flush buffers on reset, clear prefetch cache."""
         if reset:
             # Genuinely new conversation — flush accumulated turn buffer
-            if self._turn_buffer and self._is_alive():
+            if self._turn_buffer and self._ensure_alive():
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
                 excerpts = []
                 for turn in self._turn_buffer:
@@ -605,7 +605,7 @@ class LTMMemoryProvider:
         **kwargs,
     ) -> None:
         """Observe subagent work — save notable delegation results to LTM."""
-        if not task or not result or not self._is_alive():
+        if not task or not result or not self._ensure_alive():
             return
         if len(result) < 50:
             return  # Trivial results not worth storing
