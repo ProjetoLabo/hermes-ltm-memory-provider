@@ -41,8 +41,8 @@ memory system** powered by:
 | Capability | Without LTM | With LTM |
 |---|---|---|
 | **Permanent storage** | MEMORY.md / USER.md (~2K chars each) | Unlimited SQLite |
-| **Semantic search** | Manual grep / session_search | `ltm_search` tool — Granite ONNX vector search |
-| **Automatic recall** | None | `prefetch()` — relevant context auto-injected per turn |
+| **Manual recall** | `session_search` (FTS5 only) | `ltm_search` tool — Granite ONNX vector search (works regardless of `auto_recall` flag) |
+| **Automatic recall** | None | `auto_recall` flag — relevant context auto-injected per turn. **Disable to save tokens** by setting `plugins.ltm.auto_recall: false` |
 | **Persist decisions** | Manual memory tool | `ltm_add` tool — permanent with embedding |
 | **Pre-compression save** | Lost on context compact | `on_pre_compress` — saves + prompts compressor LLM |
 | **End-of-session save** | Lost on `/new` | `on_session_end` — saves + auto-export Obsidian |
@@ -422,7 +422,7 @@ write to `~/.hermes/plugins/ltm/__init__.py`.
 wc -l ~/.hermes/plugins/ltm/__init__.py
 ```
 
-Expected: ~737 lines.
+Expected: ~739 lines.
 
 ---
 
@@ -448,7 +448,11 @@ memory:
 #### 7b. Set plugin configuration (optional)
 
 ```bash
+# Default number of results for auto-recall and ltm_search tool
 hermes config set plugins.ltm.search_top_k 3
+
+# Disable auto-recall to save tokens (manual search only via ltm_search tool)
+hermes config set plugins.ltm.auto_recall false
 ```
 
 If using Obsidian:
@@ -456,6 +460,15 @@ If using Obsidian:
 hermes config set plugins.ltm.obsidian_vault "~/Documents/Obsidian Vault"
 hermes config set plugins.ltm.auto_export_obsidian true
 ```
+
+##### Plugin configuration reference
+
+| Key | Default | Description |
+|---|---|---|
+| `search_top_k` | `3` | Number of results returned by `ltm_search` tool and auto-recall prefetch. |
+| `auto_recall` | `true` | When `true`, LTM context is **auto-injected every turn** (system prompt block + background semantic search). When `false`, the tools (`ltm_search`/`ltm_add`) still work, but no context is injected automatically — saving tokens on every turn. |
+| `obsidian_vault` | `~/Documents/Obsidian Vault` | Path to Obsidian vault for auto-export on session end. |
+| `auto_export_obsidian` | `true` | Automatically export new memories to Obsidian vault. |
 
 ##### Environment variables reference
 

@@ -170,6 +170,7 @@ class LTMMemoryProvider:
         )
         self._auto_export: bool = self._config.get("auto_export_obsidian", True)
         self._search_top_k: int = int(self._config.get("search_top_k", DEFAULT_SEARCH_TOP_K))
+        self._auto_recall: bool = self._config.get("auto_recall", True)
         self._initialized: bool = False
 
     # -- Properties ----------------------------------------------------------
@@ -205,6 +206,12 @@ class LTMMemoryProvider:
                 "key": "search_top_k",
                 "description": "Default number of results for prefetch recall",
                 "default": str(DEFAULT_SEARCH_TOP_K),
+            },
+            {
+                "key": "auto_recall",
+                "description": "Auto-inject LTM context into every turn (system prompt block + prefetch recall)",
+                "default": "true",
+                "choices": ["true", "false"],
             },
         ]
 
@@ -268,7 +275,7 @@ class LTMMemoryProvider:
 
     def system_prompt_block(self) -> str:
         """Return static text for the system prompt."""
-        if not self._initialized:
+        if not self._initialized or not self._auto_recall:
             return ""
         if self._total_memories == 0:
             return (
@@ -284,10 +291,12 @@ class LTMMemoryProvider:
             f"Use ltm_add to store important permanent information."
         )
 
-    # -- Recall: prefetch / queue_prefetch -----------------------------------
+    # -- Recall: prefetch / queue_prefetch ------------------------------------
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background Granite ONNX search for the next turn."""
+        if not self._auto_recall:
+            return
         if not query or len(query.strip()) < 3 or not self._is_alive():
             return
 
@@ -312,6 +321,8 @@ class LTMMemoryProvider:
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return cached prefetch results (instant, no subprocess call)."""
+        if not self._auto_recall:
+            return ""
         return self._prefetch_cache
 
     def _format_prefetch(self, result: dict) -> str:
@@ -331,7 +342,7 @@ class LTMMemoryProvider:
                 lines.append(f"- [{sim:.2f}] **{title}**: {content}")
         return "\n".join(lines)
 
-    # -- Turn persistence ----------------------------------------------------
+    # -- Turn persistence -----------------------------------------------------
 
     def sync_turn(
         self,
@@ -628,7 +639,7 @@ class LTMMemoryProvider:
         self._prefetch_cache = ""
         self._turn_buffer.clear()
 
-    # -- Internal helpers ----------------------------------------------------
+    # -- Internal helpers -----------------------------------------------------
 
     def _is_alive(self) -> bool:
         """Check if the subprocess is running and healthy."""
