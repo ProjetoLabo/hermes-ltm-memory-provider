@@ -924,7 +924,7 @@ hooks:
   - on_session_switch
 ```
 
-### A6: `__init__.py` (737 lines)
+### A6: `__init__.py` (748 lines)
 
 **Source:** `plugins/ltm/__init__.py` in this repository.
 
@@ -941,6 +941,9 @@ The MemoryProvider ABC implementation. Contains:
 - **`register(ctx)`** — plugin entry point
 - **`_load_plugin_config()`** — config loader
 - **`LTM_SEARCH_SCHEMA`**, **`LTM_ADD_SCHEMA`** — tool definitions
+
+> **v1.1.0** — `auto_recall` flag for token-saving (disable auto-injection).  
+> **v1.1.1** — `_ensure_alive` replaces `_is_alive` in all hooks for automatic subprocess restart after idle timeout. All 8 hook methods now auto-restart the subprocess instead of failing silently.
 
 ---
 

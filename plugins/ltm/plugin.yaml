@@ -1,5 +1,5 @@
 name: ltm
-version: 1.0.0
+version: 1.1.1
 description: >
   Labo LTM MemoryProvider — Granite-97m ONNX embeddings + SQLite-vec.
   Subprocess-isolated (runs in ltm-env venv), fully local, zero external
