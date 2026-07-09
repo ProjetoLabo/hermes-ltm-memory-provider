@@ -30,7 +30,10 @@ memory system** powered by:
 | Component | Role |
 |---|---|
 | **Granite-97m ONNX** (IBM) | Multilingual semantic embedding model (384-dim, int8 quantized) |
-| **SQLite + sqlite-vec** | Vector database for similarity search |
+| **SQLite + sqlite-vec** | Vector database for semantic similarity search |
+| **SQLite FTS5 / BM25** | Full-text index for lexical search (complementary to vector search) |
+| **Hybrid search (RRF)** | Reciprocal Rank Fusion merging semantic + lexical results |
+| **Centroid classifier** | Multilingual category classification via embedding centroids (no hardcoded keywords) |
 | **Subprocess isolation** | LTM runs in its own Python venv — zero conflicts with Hermes deps |
 | **Idle timeout** | Auto-exits after 15min idle (`LTM_IDLE_TIMEOUT`) — no orphaned processes |
 | **Auto-restart** | Plugin auto-restarts subprocess if it exits (idle timeout or crash) |
@@ -41,7 +44,7 @@ memory system** powered by:
 | Capability | Without LTM | With LTM |
 |---|---|---|
 | **Permanent storage** | MEMORY.md / USER.md (~2K chars each) | Unlimited SQLite |
-| **Manual recall** | `session_search` (FTS5 only) | `ltm_search` tool — Granite ONNX vector search (works regardless of `auto_recall` flag) |
+| **Manual recall** | `session_search` (FTS5 only) | `ltm_search` tool — **hybrid search** (Granite ONNX vectors + FTS5/BM25 merged via RRF). Works regardless of `auto_recall` flag. |
 | **Automatic recall** | None | `auto_recall` flag — relevant context auto-injected per turn. **Disable to save tokens** by setting `plugins.ltm.auto_recall: false` |
 | **Persist decisions** | Manual memory tool | `ltm_add` tool — permanent with embedding |
 | **Pre-compression save** | Lost on context compact | `on_pre_compress` — saves + prompts compressor LLM |
@@ -54,29 +57,42 @@ memory system** powered by:
 
 ```
   HERMES AGENT (Python 3.x)               LTM SUBPROCESS (ltm-env, Python 3.x)
-  ┌─────────────────────────┐             ┌──────────────────────────────┐
-  │    LTMMemoryProvider     │  ────►     │        ltm_ops.py            │
-  │                         │  stdin/     │  ┌──────── ─────────┐       │
-  │  initialize()           │  stdout     │  │ search (Granite  │       │
-  │  queue_prefetch()───►───┼───JSON───►──┤  │  ONNX + sqlite-) │       │
-  │  prefetch() (cache)     │  ◄──────────┤  │  vec)            │       │
-  │  sync_turn() (buffer)   │  response   │  ├──────────────────┤       │
-  │  on_pre_compress()      │             │  │ add (embed +     │       │
-  │  on_session_end()       │             │  │  insert)         │       │
-  │  on_memory_write()      │             │  ├──────────────────┤       │
-  │  on_delegation()        │             │  │ stats / ping     │       │
-  │                         │             │  └──────────────────┘       │
-  │  Tools: ltm_search      │             │  Depends on:                │
-  │         ltm_add         │             │  query_memory.py            │
-  └─────────────────────────┘             │  ltm_manager.py             │
-                                          │  granite_embedder.py        │
-                                          └───────────┬──────────────────┘
+  ┌─────────────────────────┐             ┌──────────────────────────────────────┐
+  │    LTMMemoryProvider     │  ────►     │          ltm_ops.py                  │
+  │                         │  stdin/     │  ┌──────────┬───────────┬──────────┐ │
+  │  initialize()           │  stdout     │  │ SEMANTIC │  LEXICAL  │ CLASSIFY │ │
+  │  queue_prefetch()───►───┼───JSON───►──┤  │ (Granite │ (FTS5/    │(Centroid)│ │
+  │  prefetch() (cache)     │  ◄──────────┤  │  ONNX +  │  BM25)    │ ──────── │ │
+  │  sync_turn() (buffer)   │  response   │  │  sqlite- │           │Category  │ │
+  │  on_pre_compress()      │             │  │  vec)    │           │per text  │ │
+  │  on_session_end()       │             │  ├──────────┴───────────┤          │ │
+  │  on_memory_write()      │             │  │  RRF MERGE           │          │ │
+  │  on_delegation()        │             │  │  (Reciprocal Rank    │          │ │
+  │                         │             │  │   Fusion, K=60)      │          │ │
+  │  Tools: ltm_search      │             │  ├──────────────────────┤          │ │
+  │         ltm_add         │             │  │ add (embed +         │          │ │
+  │                         │             │  │  FTS5 sync + insert) │          │ │
+  │  Category classifier:   │             │  ├──────────────────────┤          │ │
+  │  classify_category()    │             │  │ stats / ping         │          │ │
+  │  (embedding centroid)   │             │  └──────────────────────┘          │ │
+  └─────────────────────────┘             │  Depends on:                       │
+                                          │  query_memory.py                   │
+                                          │  ltm_manager.py                    │
+                                          │  granite_embedder.py               │
+                                          └───────────┬────────────────────────┘
                                                       │
                                                       ▼
-                                          ┌──────────────────────┐
-                                          │  longterm-memory.db  │
-                                          │  (SQLite + vec0)     │
-                                          └──────────────────────┘
+                                          ┌──────────────────────────────────────┐
+                                          │        longterm-memory.db            │
+                                          │  ┌──────────┐ ┌──────────┐          │
+                                          │  │ memories │ │  chunks  │          │
+                                          │  ├──────────┤ ├──────────┤          │
+                                          │  │ vec_chunks│ │chunks_fts│          │
+                                          │  │ (vec0)   │ │ (FTS5)   │          │
+                                          │  └──────────┘ └──────────┘          │
+                                          │  Semantic ←─ vec0 ──→ Lexical       │
+                                          │  + BM25 via RRF merge               │
+                                          └──────────────────────────────────────┘
 ```
 
 ### Data flow per turn
@@ -122,13 +138,13 @@ ltm-memory-provider/
 ├── README.md                       ← this guide
 ├── src/
 │   ├── granite_embedder.py         ONNX model wrapper (68 lines)
-│   ├── query_memory.py             SQLite DB + embedding pipeline (646 lines)
-│   ├── ltm_manager.py              High-level search/export/status (526 lines)
-│   └── ltm_ops.py                  Subprocess bridge (260 lines)
+│   ├── query_memory.py             SQLite DB + embedding + FTS5/BM25 + hybrid search (822 lines)
+│   ├── ltm_manager.py              High-level search/export/classify (625 lines)
+│   └── ltm_ops.py                  Subprocess bridge (261 lines)
 └── plugins/
     └── ltm/
         ├── plugin.yaml             Plugin configuration
-        └── __init__.py             MemoryProvider implementation (706 lines)
+        └── __init__.py             MemoryProvider implementation (748 lines)
 ```
 
 **For the installing agent:** For each file, use:
@@ -871,39 +887,44 @@ class GraniteONNXEmbedder:
         return pooled.tolist()
 ```
 
-### A2: `query_memory.py` (646 lines)
+### A2: `query_memory.py` (822 lines)
 
 **Source:** `src/query_memory.py` in this repository.
 
 Comprehensive file that provides:
-- SQLite connection with WAL mode, sqlite-vec vector extension
-- `get_db()`, `init_db(db)` — schema creation (`memories`, `chunks`, `vec_chunks` tables)
-- `add_memory(db, title, content, category, tags, source)` — insert + embed
-- `search_memory(db, query, top_k, category)` — vector similarity search
+- SQLite connection with WAL mode, sqlite-vec vector extension, and FTS5 full-text search
+- `get_db()`, `init_db(db)` — schema creation (`memories`, `chunks`, `vec_chunks`, `chunks_fts` tables)
+- `add_memory(db, title, content, category, tags, source)` — insert + embed + FTS5 sync
+- **`hybrid_search(db, query, top_k, category)`** — merges semantic (sqlite-vec) + lexical (FTS5/BM25) via RRF (Reciprocal Rank Fusion, K=60)
+- `search_fts(db, query, top_k, category)` — pure FTS5/BM25 lexical search with LIKE fallback
+- `search_memory(db, query, top_k, category)` — CLI-friendly hybrid search
 - `get_memory(db, id)`, `update_memory(...)`, `delete_memory(db, id)`
 - `list_memories(db, category, status, limit)`
-- `import_vault(db, path)` — import Obsidian .md files
-- `reindex_all(db)` — regenerate all embeddings
+- `import_vault(db, path)` — import Obsidian .md files (bilingual PT/EN detection)
+- `reindex_all(db)` — regenerate all embeddings + rebuild FTS5 index
 - Granite ONNX model singleton (`_get_model()`)
 - Text chunking (`chunk_text()`)
 - Embedding conversion utilities (`embedding_to_blob()`, `vec_embedding()`)
+- Auto-migration: legacy PT category names → EN on startup
 - CLI parser for standalone use
 
-### A3: `ltm_manager.py` (526 lines)
+### A3: `ltm_manager.py` (625 lines)
 
 **Source:** `src/ltm_manager.py` in this repository.
 
 Provides high-level operations:
-- `classify_category(text)` — keyword-based categorization
+- `classify_category(text)` — **centroid-based classification** using Granite multilingual embeddings (replaces legacy keyword matching). Works across all languages supported by the embedding model.
 - `offload_entries(entries_json)` — migrate runtime entries to SQLite
-- `query_context(topic, top_k, category)` — semantic search returning JSON
+- `query_context(topic, top_k, category)` — hybrid semantic + lexical search returning JSON
 - `init_session_context()` — session startup info
 - `consolidate_memories(threshold)` — dedup similar entries
 - `status_report()` — DB statistics as JSON
 - `export_obsidian(vault_path)` — full Obsidian vault export
 - CLI parser for standalone use
 
-### A4: `ltm_ops.py` (260 lines)
+The classification uses 8 categories: `general`, `infrastructure`, `config`, `project`, `research`, `decision`, `correction`, `debug`. Each has multilingual seed phrases (EN, PT, ES, FR) whose embedding centroids are computed at runtime.
+
+### A4: `ltm_ops.py` (261 lines)
 
 **Source:** `src/ltm_ops.py` in this repository.
 
@@ -924,13 +945,14 @@ Features:
 
 ```yaml
 name: ltm
-version: 1.0.0
+version: 1.1.2
 description: >
-  Labo LTM MemoryProvider — Granite-97m ONNX embeddings + SQLite-vec.
-  Subprocess-isolated (runs in ltm-env venv), fully local, zero external
-  dependencies. Provides automatic recall via prefetch, semantic search via
-  ltm_search tool, fact extraction on_pre_compress and on_session_end, and
-  mirrors built-in memory writes to the LTM SQLite database.
+  Labo LTM MemoryProvider — Granite-97m ONNX embeddings + SQLite-vec + FTS5
+  hybrid search (RRF). Subprocess-isolated (runs in ltm-env venv), fully
+  local, zero external dependencies. Provides automatic recall via prefetch,
+  hybrid search (semantic + BM25) via ltm_search tool, fact extraction via
+  on_pre_compress and on_session_end, and mirrors built-in memory writes
+  to the LTM SQLite database. Multilingual centroid-based classification.
   Features idle timeout (LTM_IDLE_TIMEOUT) and auto-restart for resilience.
 hooks:
   - on_session_end
