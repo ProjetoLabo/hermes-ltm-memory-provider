@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Labo Long-Term Memory Manager — Integração Hermes ↔ SQLite + Granite-97m
+Labo Long-Term Memory Manager — Hermes <-> SQLite + Granite-97m
 
-Camada de alto nível que o Hermes Agent usa para:
-  1. OFFLOAD: migrar entradas da runtime memory p/ SQLite (libera espaço)
-  2. CONSULTA: busca semântica automática por tema da sessão
-  3. CONSOLIDAÇÃO: dedup + merge de memórias similares
-  4. SINCRONIZAÇÃO: manter runtime memory enxuta com ponteiros
+High-level layer used by the Hermes Agent to:
+  1. OFFLOAD: migrate runtime memory entries into SQLite (frees up context)
+  2. QUERY: hybrid semantic + lexical search by session topic
+  3. CONSOLIDATE: dedup + merge of similar memories
+  4. SYNC: keep runtime memory lean with pointers
 
-Uso:
-  ltm_manager.py offload <json_entries>     # Recebe JSON da runtime, arquiva no SQLite
-  ltm_manager.py query <topic> [--top_k 5]  # Busca semântica por tema
-  ltm_manager.py context <topics_json>       # Gera contexto relevante para injeção no prompt
-  ltm_manager.py consolidate [--threshold 0.85]  # Dedup de memórias similares
-  ltm_manager.py status                      # Relatório: runtime vs SQLite
-  ltm_manager.py export-obsidian <path>      # Exporta tudo para formato Obsidian
-  ltm_manager.py init-session                # Retorna contexto relevante para nova sessão
+Usage:
+  ltm_manager.py offload <json_entries>     # Receive JSON from runtime, archive in SQLite
+  ltm_manager.py query <topic> [--top_k 5]  # Semantic search by topic
+  ltm_manager.py context <topics_json>       # Generate relevant context for prompt injection
+  ltm_manager.py consolidate [--threshold 0.85]  # Dedup of similar memories
+  ltm_manager.py status                      # Report: runtime vs SQLite
+  ltm_manager.py export-obsidian <path>      # Export everything to Obsidian format
+  ltm_manager.py init-session                # Return relevant context for new session
 """
 
 import argparse
@@ -26,7 +26,7 @@ import sqlite3
 import sys
 import datetime
 
-# Reutilizar infra do query_memory
+# Reuse query_memory infrastructure
 sys.path.insert(0, os.path.dirname(__file__))
 from query_memory import (
     DB_PATH, VENV_PYTHON, MODEL_NAME, EMBEDDING_DIM,
@@ -38,45 +38,191 @@ from query_memory import (
     stats_db
 )
 
-# Categorias mapeadas por tipo de conteúdo
-CATEGORY_KEYWORDS = {
-    "infraestrutura": ["infra", "servidor", "cronjob", "deploy", "docker", "nginx", "ssh", "firewall", "rede", "vpn"],
-    "config": ["config", "yaml", ".env", "variável", "variavel", "setting", "instalação", "instalacao", "setup"],
-    "projeto": ["projeto", "bot", "trading", "pipeline", "app", "sistema", "feature", "módulo", "modulo"],
-    "pesquisa": ["pesquisa", "framework", "biblioteca", "api", "sdk", "referência", "comparação", "benchmark"],
-    "decisao": ["decisão", "decisao", "debate", "trade-off", "escolha", "arquitetura", "approach"],
-    "correcao": ["nunca", "sempre", "não fazer", "nao fazer", "obrigatório", "obrigatorio", "regra", "prefere"],
-    "debug": ["erro", "bug", "fix", "workaround", "falha", "timeout", "crash", "debug"],
+# ---------------------------------------------------------------------------
+# Multilingual seed phrases for centroid-based category classification
+#
+# Each category has seed phrases in multiple languages (PT, EN, ES, FR).
+# The Granite-97m multilingual embedding model projects them into a shared
+# semantic space, and the centroid (mean embedding) is used for classification.
+# This works for ANY language the model supports — no keyword lists needed.
+# ---------------------------------------------------------------------------
+CATEGORY_SEEDS = {
+    "general": [
+        "General notes and miscellaneous information",
+        "Notas gerais e informações diversas",
+        "Uncategorized content and random notes",
+        "Notes générales et informations diverses",
+    ],
+    "infrastructure": [
+        "Server setup, deployment and networking",
+        "Configuração de servidor, docker e infraestrutura",
+        "SSH, nginx, firewall and system administration",
+        "Implantación de servicios y administración de redes",
+    ],
+    "config": [
+        "Configuration files, environment variables and settings",
+        "Configurações de YAML, variáveis de ambiente e setup",
+        "Installation and setup instructions",
+        "Fichiers de configuration, variables d'environnement",
+    ],
+    "project": [
+        "Project development, features and modules",
+        "Desenvolvimento de projeto, bot, app e sistema",
+        "Pipeline implementation and application architecture",
+        "Desarrollo de proyectos y aplicaciones",
+    ],
+    "research": [
+        "Technical research, frameworks and benchmarks",
+        "Pesquisa de bibliotecas, APIs e referências técnicas",
+        "Comparison of tools, SDKs and technologies",
+        "Recherche technique, frameworks et API",
+    ],
+    "decision": [
+        "Architectural decisions, trade-offs and technical debates",
+        "Decisões de arquitetura, design rationale e trade-offs",
+        "Technical choices and approach justifications",
+        "Decisiones técnicas y justificaciones de diseño",
+        "Choosing between PostgreSQL and MySQL for the database",
+        "Opting for Redis instead of Memcached for caching",
+        "Decidir entre FastAPI e Flask para a API",
+        "We chose React over Vue for the frontend framework",
+        "Evaluating and selecting cloud providers or hosting solutions",
+    ],
+    "correction": [
+        "Rules, constraints and mandatory requirements",
+        "Regras importantes, correções e proibições",
+        "Never-do patterns and behavioral guidelines",
+        "Règles importantes et comportements à éviter",
+        "Nunca instale pacotes sem verificar a procedência",
+        "Never commit secrets or credentials to the repository",
+        "Always validate input before processing user data",
+        "Obrigatório usar type hints em todas as funções",
+        "Must follow the established coding conventions",
+    ],
+    "debug": [
+        "Bug fixes, errors, workarounds and troubleshooting",
+        "Correção de bugs, erros, timeout e debug",
+        "Failure analysis and crash resolution",
+        "Analyse d'erreurs, correctifs et dépannage",
+    ],
 }
 
-# Entradas que NÃO devem ser offloaded (ficam na runtime)
+# Module-level cache for centroid embeddings — built lazily on first classify_category() call
+_CATEGORY_CENTROIDS = {}
+
+
+def _build_category_centroids():
+    """Build centroid embeddings for each category using the Granite multilingual model.
+
+    Embeds all seed phrases for all categories in a single batch call, then
+    averages per-category embeddings to produce one centroid per category.
+    Centroids are cached globally and rebuilt on subprocess restart.
+    """
+    global _CATEGORY_CENTROIDS
+    if _CATEGORY_CENTROIDS:
+        return  # Already built
+
+    # Flatten seeds, keeping track of category boundaries
+    boundaries = []
+    all_seeds = []
+    for cat, seeds in CATEGORY_SEEDS.items():
+        if not seeds:
+            continue
+        boundaries.append((cat, len(seeds)))
+        all_seeds.extend(seeds)
+
+    if not all_seeds:
+        return
+
+    try:
+        all_embs = embed_texts(all_seeds)  # Single batch call
+    except Exception:
+        # Model not available — centroids stay empty, classify_category returns "general"
+        return
+
+    idx = 0
+    for cat, count in boundaries:
+        cat_embs = all_embs[idx:idx + count]
+        # Average all seed embeddings to get centroid
+        centroid = [sum(vals) / count for vals in zip(*cat_embs)]
+        _CATEGORY_CENTROIDS[cat] = centroid
+        idx += count
+
+
+def _cosine_similarity(a, b):
+    """Compute cosine similarity between two embedding vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    return dot / (norm_a * norm_b + 1e-10)
+
+
+def classify_category(text):
+    """Classify text into a category using embedding similarity.
+
+    Uses the Granite multilingual model to compute semantic similarity
+    between the input text and each category's centroid. This approach
+    works across ALL languages supported by the embedding model —
+    no hardcoded keyword lists per language.
+
+    Falls back to 'general' when confidence is below 0.15 threshold
+    or when the embedding model is unavailable.
+    """
+    if not text or not text.strip():
+        return "general"
+
+    # Build centroids lazily on first call
+    if not _CATEGORY_CENTROIDS:
+        _build_category_centroids()
+
+    # If centroids failed to build (model unavailable), return fallback
+    if not _CATEGORY_CENTROIDS:
+        return "general"
+
+    try:
+        emb = embed_texts([text])[0]
+    except Exception:
+        return "general"
+
+    best_cat = "general"
+    best_sim = -1.0
+    threshold = 0.15
+
+    for cat, centroid in _CATEGORY_CENTROIDS.items():
+        if centroid is None:
+            continue
+        sim = _cosine_similarity(emb, centroid)
+        if sim > best_sim:
+            best_sim = sim
+            best_cat = cat
+
+    return best_cat if best_sim >= threshold else "general"
+
+
+# Entries that should NOT be offloaded (stay in runtime memory)
 RUNTIME_ONLY_PATTERNS = [
-    r"chama.*Labo",
+    r"call.*Labo",
     r"respostas concisas",
+    r"concise answers",
     r"NUNCA instalar",
+    r"NEVER install",
     r"NUNCA criar cron",
+    r"NEVER create cron",
     r"modelo padrão",
+    r"default model",
     r"StealthyFetcher",
     r"prefere",
+    r"prefer",
     r"Navarro",
 ]
 
 
-def classify_category(text):
-    """Classifica o texto em uma categoria baseado em keywords."""
-    text_lower = text.lower()
-    scores = {}
-    for cat, keywords in CATEGORY_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in text_lower)
-        if score > 0:
-            scores[cat] = score
-    if scores:
-        return max(scores, key=scores.get)
-    return "geral"
-
-
 def should_stay_runtime(text):
-    """Verifica se a entrada deve permanecer na runtime memory."""
+    """Check if memory entry should remain in runtime memory instead of SQLite.
+
+    Returns True for entries matching patterns that are session-specific
+    or private (user preferences, behavioral rules, personal identifiers).
+    """
     for pattern in RUNTIME_ONLY_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return True
@@ -84,23 +230,23 @@ def should_stay_runtime(text):
 
 
 def offload_entries(entries_json):
-    """
-    Recebe JSON com entradas da runtime memory e arquiva no SQLite.
-    Retorna JSON com: offloaded (sucesso), skipped (ficam na runtime), errors.
-    
-    Formato de entrada: [{"text": "...", "target": "memory"|"user"}, ...]
+    """Receive JSON runtime entries and archive them in SQLite.
+
+    Returns JSON with: offloaded (successful), skipped (stay in runtime), errors.
+
+    Input format: [{"text": "...", "target": "memory"|"user"}, ...]
     """
     try:
         entries = json.loads(entries_json) if isinstance(entries_json, str) else entries_json
     except json.JSONDecodeError as e:
-        return json.dumps({"error": f"JSON inválido: {e}"})
+        return json.dumps({"error": f"Invalid JSON: {e}"})
 
     db = get_db()
-    # Garantir schema
+    # Ensure schema
     try:
         init_db(db)
     except Exception:
-        pass  # Schema já existe
+        pass  # Schema already exists
 
     result = {"offloaded": [], "skipped": [], "errors": []}
 
@@ -109,36 +255,36 @@ def offload_entries(entries_json):
         target = entry.get("target", "memory")
 
         if not text or len(text) < 20:
-            result["skipped"].append({"reason": "muito_curto", "text": text[:80]})
+            result["skipped"].append({"reason": "too_short", "text": text[:80]})
             continue
 
-        # Verificar se deve ficar na runtime
+        # Check if it should stay in runtime
         if should_stay_runtime(text):
             result["skipped"].append({"reason": "runtime_essential", "text": text[:80]})
             continue
 
-        # Classificar categoria
+        # Classify category
         category = classify_category(text)
 
-        # Gerar título automático
+        # Generate auto title
         title = generate_title(text, target)
 
-        # Verificar dedup por similaridade (busca antes de inserir)
+        # Check dedup by similarity (search before insert)
         try:
             dup_check = check_duplicate(db, text, threshold=0.88)
             if dup_check:
                 result["skipped"].append({
-                    "reason": "duplicata",
+                    "reason": "duplicate",
                     "existing_id": dup_check,
                     "text": text[:80]
                 })
                 continue
         except Exception:
-            pass  # Se busca falhar, prosseguir com inserção
+            pass  # If search fails, proceed with insertion
 
-        # Inserir no SQLite
+        # Insert into SQLite
         try:
-            mem_id = add_memory(db, title, text, category=category, 
+            mem_id = add_memory(db, title, text, category=category,
                               tags=f"offload-{target}", source=f"hermes-runtime-{target}")
             result["offloaded"].append({
                 "id": mem_id,
@@ -154,7 +300,7 @@ def offload_entries(entries_json):
 
 
 def check_duplicate(db, text, threshold=0.88):
-    """Verifica se já existe memória similar. Retorna ID se duplicata, None caso contrário."""
+    """Check if a similar memory already exists. Returns ID if duplicate, None otherwise."""
     try:
         query_emb = embed_texts([text])[0]
         k = 3
@@ -170,7 +316,7 @@ def check_duplicate(db, text, threshold=0.88):
         """
         results = db.execute(sql, [vec_embedding(query_emb), k]).fetchall()
         if results:
-            # Converter distância euclidiana para similaridade de cosseno
+            # Convert euclidean distance to cosine similarity
             similarity = 1 - (results[0]["distance"] ** 2) / 2
             if similarity >= threshold:
                 return results[0]["memory_id"]
@@ -180,8 +326,8 @@ def check_duplicate(db, text, threshold=0.88):
 
 
 def generate_title(text, target="memory"):
-    """Gera título automático para a entrada."""
-    # Pegar primeira linha significativa
+    """Auto-generate a title for the entry."""
+    # Get first meaningful line
     lines = text.strip().split("\n")
     first_line = ""
     for line in lines:
@@ -189,24 +335,24 @@ def generate_title(text, target="memory"):
         if clean and len(clean) > 5:
             first_line = clean
             break
-    
+
     if not first_line:
         first_line = text[:60]
-    
-    # Truncar
+
+    # Truncate
     title = first_line[:80]
     if len(first_line) > 80:
         title = title.rsplit(" ", 1)[0] + "..."
-    
-    # Prefixo por target
+
+    # Prefix by target
     prefix = "User" if target == "user" else "Labo"
     return f"{prefix} — {title}"
 
 
 def query_context(topic, top_k=5, category=None):
-    """
-    Busca híbrida (semântica + lexical FTS5/BM25) e retorna JSON com contexto.
-    Usado pelo Hermes para injetar contexto no prompt.
+    """Hybrid search (semantic + lexical FTS5/BM25) returning JSON context.
+
+    Used by Hermes to inject relevant context into the prompt.
     """
     db = get_db()
 
@@ -214,14 +360,14 @@ def query_context(topic, top_k=5, category=None):
         results = hybrid_search(db, topic, top_k, category)
     except Exception as e:
         db.close()
-        return json.dumps({"error": f"Erro na busca híbrida: {e}"})
+        return json.dumps({"error": f"Hybrid search error: {e}"})
 
     context_entries = []
     for r in results:
         sim = r.get("semantic_similarity", 0)
         rrf = r.get("rrf_score", 0)
 
-        # Threshold menos restritivo para resultados que vieram do FTS5
+        # Less restrictive threshold for results that came from FTS5
         if sim < 0.30 and rrf < 0.008:
             continue
 
@@ -249,21 +395,21 @@ def query_context(topic, top_k=5, category=None):
 
 
 def init_session_context():
-    """
-    Retorna contexto resumido para início de sessão.
-    Combina: stats do DB + categorias com mais memórias + últimas atualizações.
+    """Return a summarized context for session startup.
+
+    Combines: DB stats + top categories + latest updates.
     """
     db = get_db()
 
-    # Stats gerais
+    # Overall stats
     mem_count = db.execute("SELECT COUNT(*) FROM memories WHERE status='ativa'").fetchone()[0]
-    
-    # Categorias
+
+    # Categories
     cats = db.execute(
         "SELECT category, COUNT(*) as c FROM memories WHERE status='ativa' GROUP BY category ORDER BY c DESC"
     ).fetchall()
-    
-    # Últimas 5 atualizações
+
+    # Last 5 updates
     recent = db.execute(
         "SELECT id, title, category, updated_at FROM memories WHERE status='ativa' ORDER BY updated_at DESC LIMIT 5"
     ).fetchall()
@@ -283,9 +429,9 @@ def init_session_context():
 
 
 def consolidate_memories(threshold=0.85):
-    """
-    Busca memórias similares e propõe merge.
-    Retorna JSON com pares duplicados para aprovação.
+    """Find similar memories and propose a merge.
+
+    Returns JSON with duplicate pairs for approval.
     """
     db = get_db()
     memories = db.execute(
@@ -294,23 +440,22 @@ def consolidate_memories(threshold=0.85):
 
     if len(memories) < 2:
         db.close()
-        return json.dumps({"message": "Poucas memórias para consolidar", "pairs": []})
+        return json.dumps({"message": "Not enough memories to consolidate", "pairs": []})
 
-    # Comparar todos os pares via embeddings
-    # Para performance: embed tudo de uma vez
+    # Compare all pairs via embeddings
     texts = [f"{m['title']} {m['content'][:200]}" for m in memories]
-    
+
     try:
         embeddings = embed_texts(texts)
     except Exception as e:
         db.close()
-        return json.dumps({"error": f"Erro gerando embeddings: {e}"})
+        return json.dumps({"error": f"Error generating embeddings: {e}"})
 
-    # Encontrar pares similares
+    # Find similar pairs
     pairs = []
     for i in range(len(embeddings)):
         for j in range(i + 1, len(embeddings)):
-            # Similaridade de cosseno
+            # Cosine similarity
             dot = sum(a * b for a, b in zip(embeddings[i], embeddings[j]))
             norm_i = sum(a * a for a in embeddings[i]) ** 0.5
             norm_j = sum(a * a for a in embeddings[j]) ** 0.5
@@ -322,7 +467,7 @@ def consolidate_memories(threshold=0.85):
                     "memory_a": {"id": memories[i]["id"], "title": memories[i]["title"]},
                     "memory_b": {"id": memories[j]["id"], "title": memories[j]["title"]},
                     "similarity": round(sim, 3),
-                    "action": "merge_into_a"  # Por default, merge B → A
+                    "action": "merge_into_a"  # By default, merge B into A
                 })
 
     db.close()
@@ -334,16 +479,16 @@ def consolidate_memories(threshold=0.85):
 
 
 def status_report():
-    """Relatório comparativo runtime vs SQLite."""
+    """Comparative report: runtime memory vs SQLite."""
     db = get_db()
-    
+
     mem_count = db.execute("SELECT COUNT(*) FROM memories WHERE status='ativa'").fetchone()[0]
     chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
     categories = db.execute(
         "SELECT category, COUNT(*) FROM memories WHERE status='ativa' GROUP BY category ORDER BY COUNT(*) DESC"
     ).fetchall()
-    
+
     db.close()
 
     report = {
@@ -356,74 +501,74 @@ def status_report():
         },
         "runtime_memory": {
             "max_chars": 2200,
-            "note": "Verificar uso atual via memory tool do Hermes"
+            "note": "Check current usage via Hermes memory tool"
         },
-        "capacity_ratio": f"~{mem_count * 500 // 2200}x mais capacidade no SQLite",
+        "capacity_ratio": f"~{mem_count * 500 // 2200}x more capacity in SQLite",
     }
     return json.dumps(report, ensure_ascii=False)
 
 
 def export_obsidian(vault_path):
-    """Exporta todas as memórias do SQLite para notas Obsidian."""
+    """Export all SQLite memories to Obsidian notes."""
     db = get_db()
     vault = os.path.expanduser(vault_path)
-    
+
     if not os.path.isdir(vault):
         os.makedirs(vault, exist_ok=True)
-    
+
     memories = db.execute("SELECT * FROM memories WHERE status='ativa' ORDER BY category, title").fetchall()
     db.close()
-    
+
     exported = 0
     for mem in memories:
-        # Nome do arquivo: categoria + título
+        # Filename: safe title
         safe_title = re.sub(r'[^\w\s—-]', '', mem["title"]).strip()
         filename = f"{safe_title}.md"
         filepath = os.path.join(vault, filename)
-        
-        # Conteúdo formatado
+
+        # Formatted content
         content = f"""# {mem['title']}
 
-> Criado em: {mem['created_at'][:10]} | Última atualização: {mem['updated_at'][:10]}
-> Categoria: {mem['category']} | Tags: {mem['tags']}
-> ID SQLite: {mem['id']}
+> Created: {mem['created_at'][:10]} | Last updated: {mem['updated_at'][:10]}
+> Category: {mem['category']} | Tags: {mem['tags']}
+> SQLite ID: {mem['id']}
 
 {mem['content']}
 
 ## Links
-- [[Labo — Memória Index]]
+- [[Labo — Memory Index]]
 """
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
         exported += 1
-    
-    # Criar index
-    index_path = os.path.join(vault, "Labo — Memória Index.md")
-    index_content = "# Labo — Memória Index\n\n> Exportado do SQLite em {}\n\n".format(
+
+    # Create index
+    index_path = os.path.join(vault, "Labo — Memory Index.md")
+    index_content = "# Labo — Memory Index\n\n> Exported from SQLite on {}\n\n".format(
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     )
-    
-    # Agrupar por categoria
+
+    # Group by category
     cats = {}
     for mem in memories:
         cat = mem["category"]
         if cat not in cats:
             cats[cat] = []
         cats[cat].append(mem["title"])
-    
+
     for cat, titles in sorted(cats.items()):
         index_content += f"\n## {cat.title()}\n\n"
         for title in titles:
             index_content += f"- [[{title}]]\n"
-    
+
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(index_content)
-    
+
     return json.dumps({"exported": exported, "vault_path": vault, "index_created": True})
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Labo LTM Manager — Integração Hermes")
+    parser = argparse.ArgumentParser(description="Labo LTM Manager — Hermes Integration")
     sub = parser.add_subparsers(dest="command")
 
     # offload
@@ -436,7 +581,7 @@ def main():
     p_q.add_argument("--top_k", type=int, default=5, help="Max results")
     p_q.add_argument("--category", default=None, help="Filter by category")
 
-    # context (alias para query com output mais compacto)
+    # context (alias for query with more compact output)
     p_ctx = sub.add_parser("context", help="Get relevant context as compact JSON")
     p_ctx.add_argument("topics", help="JSON array of topics to search")
     p_ctx.add_argument("--top_k", type=int, default=3)
@@ -469,7 +614,7 @@ def main():
 
     elif args.command == "context":
         topics = json.loads(args.topics) if isinstance(args.topics, str) else args.topics
-        # Combinar tópicos em uma query
+        # Combine topics into one query
         combined = " ".join(topics) if isinstance(topics, list) else str(topics)
         print(query_context(combined, args.top_k))
 

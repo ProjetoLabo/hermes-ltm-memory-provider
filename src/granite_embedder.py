@@ -1,8 +1,8 @@
 """
-Granite ONNX Embedder — Wrapper ONNX int8 para sentence-transformers compat.
+Granite ONNX Embedder — ONNX int8 wrapper for sentence-transformers compatible interface.
 
-Carrega granite-embedding-97m-multilingual-r2 via ONNX Runtime (int8 quantizado).
-Fornece interface compatível com SentenceTransformer.encode().
+Loads granite-embedding-97m-multilingual-r2 via ONNX Runtime (int8 quantized).
+Provides a SentenceTransformer.encode()-compatible interface.
 """
 import numpy as np
 import onnxruntime as ort
@@ -20,7 +20,7 @@ MAX_LENGTH = 8192
 
 
 class GraniteONNXEmbedder:
-    """Embedder usando granite-97m ONNX int8 com mean pooling + L2 normalize."""
+    """Embedder using granite-97m ONNX int8 with mean pooling + L2 normalize."""
 
     def __init__(self):
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
@@ -28,7 +28,7 @@ class GraniteONNXEmbedder:
         self.input_names = [inp.name for inp in self.session.get_inputs()]
 
     def encode(self, texts, normalize_embeddings=True):
-        """Codifica lista de textos para embeddings vetoriais."""
+        """Encode a list of texts into vector embeddings."""
         if isinstance(texts, str):
             texts = [texts]
 
@@ -60,7 +60,7 @@ class GraniteONNXEmbedder:
         sum_mask = np.clip(np.sum(mask, axis=1), a_min=1e-9, a_max=None)
         pooled = sum_embeddings / sum_mask
 
-        # L2 normalize (se solicitado)
+        # L2 normalize if requested
         if normalize_embeddings:
             norm = np.linalg.norm(pooled, axis=1, keepdims=True)
             pooled = pooled / norm

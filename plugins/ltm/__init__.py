@@ -84,8 +84,8 @@ LTM_SEARCH_SCHEMA = {
             },
             "category": {
                 "type": "string",
-                "description": "Filter by category: config, projeto, decisao, geral, "
-                               "infraestrutura, pesquisa, meta, devops, debug, x-post",
+                "description": "Filter by category: config, project, decision, general, "
+                               "infrastructure, research, meta, devops, debug, x-post",
             },
         },
         "required": ["query"],
@@ -115,9 +115,9 @@ LTM_ADD_SCHEMA = {
             },
             "category": {
                 "type": "string",
-                "description": "Category: config, projeto, decisao, geral, "
-                               "infraestrutura, pesquisa, meta",
-                "default": "geral",
+                "description": "Category: config, project, decision, general, "
+                               "infrastructure, research, meta",
+                "default": "general",
             },
             "tags": {
                 "type": "string",
@@ -421,7 +421,7 @@ class LTMMemoryProvider:
         """Handle ltm_add tool call — synchronous add with Granite embedding."""
         title = args.get("title", "")
         content = args.get("content", "")
-        category = args.get("category", "geral")
+        category = args.get("category", "general")
         tags = args.get("tags", "")
 
         if not title or not content:
@@ -465,9 +465,9 @@ class LTMMemoryProvider:
         # Save to LTM (async — don't block compression)
         self._send_async({
             "cmd": "add",
-            "title": f"Sessão — pré-compactação {timestamp}",
+            "title": f"Session — pre-compression {timestamp}",
             "content": combined,
-            "category": "geral",
+            "category": "general",
             "tags": "auto,pre-compress",
             "source": "ltm-provider-pre-compress",
         })
@@ -475,10 +475,10 @@ class LTMMemoryProvider:
 
         # Return prompt for the compression LLM — it will do the actual extraction
         return (
-            "\n[LTM] As mensagens abaixo foram arquivadas no banco de memória de longo prazo. "
-            "Examine cuidadosamente e preserve no resumo qualquer informação importante: "
-            "decisões, preferências do usuário, regras, configurações, correções, "
-            "estado de projetos. Não omita nada que o usuário esperaria que você lembrasse.\n"
+            "\n[LTM] The messages below have been archived in the long-term memory database. "
+            "Examine them carefully and preserve in the summary any important information: "
+            "decisions, user preferences, rules, configurations, fixes, "
+            "project status. Do not omit anything the user would expect you to remember.\n"
         )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
@@ -503,9 +503,9 @@ class LTMMemoryProvider:
             try:
                 self._send({
                     "cmd": "add",
-                    "title": f"Sessão — encerramento {timestamp}",
+                    "title": f"Session — end {timestamp}",
                     "content": combined,
-                    "category": "geral",
+                    "category": "general",
                     "tags": "auto,session-end",
                     "source": "ltm-provider-session-end",
                 })
@@ -540,7 +540,7 @@ class LTMMemoryProvider:
         if not self._ensure_alive():
             return
 
-        category = "config" if target == "user" else "geral"
+        category = "config" if target == "user" else "general"
         # Generate title from first meaningful line
         first_line = ""
         for line in content.strip().split("\n"):
@@ -584,9 +584,9 @@ class LTMMemoryProvider:
                 combined = "\n\n".join(excerpts)[:8000]
                 self._send_async({
                     "cmd": "add",
-                    "title": f"Sessão — reset {timestamp}",
+                    "title": f"Session — reset {timestamp}",
                     "content": combined,
-                    "category": "geral",
+                    "category": "general",
                     "tags": "auto,session-reset",
                     "source": "ltm-provider-session-reset",
                 })
@@ -617,7 +617,7 @@ class LTMMemoryProvider:
             "cmd": "add",
             "title": f"Delegation — {timestamp}",
             "content": combined,
-            "category": "geral",
+            "category": "general",
             "tags": "auto,delegation",
             "source": "ltm-provider-delegation",
         })

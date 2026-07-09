@@ -12,7 +12,7 @@ onnxruntime, sqlite-vec, transformers, and the Granite-97m ONNX model.
 
 Commands:
   {"cmd": "search", "query": "...", "top_k": 5, "category": null}
-  {"cmd": "add", "title": "...", "content": "...", "category": "geral", "tags": "", "source": "labo"}
+  {"cmd": "add", "title": "...", "content": "...", "category": "general", "tags": "", "source": "labo"}
   {"cmd": "add_batch", "entries": [{"title": "...", "content": "...", "category": "...", ...}]}
   {"cmd": "stats"}
   {"cmd": "init_session"}
@@ -86,7 +86,7 @@ def handle_add(data):
     """Add a single memory with Granite embedding."""
     title = data.get("title", "")
     content = data.get("content", "")
-    category = data.get("category", "geral")
+    category = data.get("category", "general")
     tags = data.get("tags", "")
     source = data.get("source", "labo")
 

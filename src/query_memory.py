@@ -2,21 +2,21 @@
 """
 Labo Long-Term Memory — SQLite + Granite-97m Multilingual
 
-Sistema de memória de longo prazo do Labo (Hermes Agent).
-SQLite como source of truth + embeddings vetoriais via sqlite-vec.
+Long-term memory system for Labo (Hermes Agent).
+SQLite as source of truth + vector embeddings via sqlite-vec.
 
-Uso:
-  query_memory.py add "Título" "Conteúdo" [--category cat] [--tags t1,t2]
-  query_memory.py search "pergunta ou tema" [--top_k 5] [--category cat]
+Usage:
+  query_memory.py add "Title" "Content" [--category cat] [--tags t1,t2]
+  query_memory.py search "query or topic" [--top_k 5] [--category cat]
   query_memory.py get <id>
   query_memory.py update <id> [--title t] [--content c] [--category cat] [--tags t1,t2] [--status s]
   query_memory.py delete <id>
-  query_memory.py list [--category cat] [--status ativa] [--limit 50]
-  query_memory.py init                    # Criar schema
-  query_memory.py import-vault <path>     # Importar notas .md do Obsidian
-  query_memory.py backup                  # Dump SQL para stdout
-  query_memory.py stats                   # Estatísticas do DB
-  query_memory.py reindex                 # Reindexar todos os embeddings
+  query_memory.py list [--category cat] [--status active] [--limit 50]
+  query_memory.py init                    # Create DB schema
+  query_memory.py import-vault <path>     # Import .md notes from Obsidian
+  query_memory.py backup                  # SQL dump to stdout
+  query_memory.py stats                   # DB statistics
+  query_memory.py reindex                 # Reindex all embeddings
 """
 
 import argparse
@@ -30,7 +30,7 @@ import struct
 import sys
 import warnings
 
-# Silenciar warnings do HuggingFace
+# Silence HuggingFace warnings
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -46,13 +46,13 @@ CHUNK_OVERLAP = 50
 
 
 def get_db():
-    """Conecta ao SQLite com WAL mode e sqlite-vec."""
+    """Connect to SQLite with WAL mode and sqlite-vec."""
     db = sqlite3.connect(DB_PATH)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.row_factory = sqlite3.Row
 
-    # Carregar extensão sqlite-vec
+    # Load sqlite-vec extension
     import sqlite_vec
     db.enable_load_extension(True)
     sqlite_vec.load(db)
@@ -62,12 +62,12 @@ def get_db():
 
 
 def init_db(db):
-    """Cria tabelas e índices vetoriais."""
+    """Create tables and vector indexes."""
     db.executescript("""
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            category TEXT DEFAULT 'geral',
+            category TEXT DEFAULT 'general',
             content TEXT NOT NULL,
             tags TEXT DEFAULT '',
             status TEXT DEFAULT 'ativa',
@@ -95,7 +95,7 @@ def init_db(db):
         CREATE INDEX IF NOT EXISTS idx_chunks_memory_id ON chunks(memory_id);
     """)
 
-    # Criar tabela virtual vetorial se não existir
+    # Create vector virtual table if it doesn't exist
     try:
         db.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks
@@ -107,7 +107,7 @@ def init_db(db):
     except sqlite3.OperationalError:
         pass
 
-    # Criar índice FTS5 para busca lexical (BM25)
+    # Create FTS5 index for lexical search (BM25)
     try:
         db.executescript("""
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -119,14 +119,14 @@ def init_db(db):
     except sqlite3.OperationalError:
         pass
 
-    # Migração one-time: se existem chunks mas FTS5 está vazio, reconstruir
+    # One-time migration: if chunks exist but FTS5 is empty, rebuild
     try:
         chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         fts_count = db.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
         if chunk_count > 0 and fts_count == 0:
-            print(f"Migração FTS5: {chunk_count} chunks encontrados, reconstruindo índice...")
+            print(f"FTS5 migration: {chunk_count} chunks found, rebuilding index...")
             _fts5_rebuild(db)
-            print("Índice FTS5 reconstruído com sucesso.")
+            print("FTS5 index rebuilt successfully.")
     except sqlite3.OperationalError:
         pass  # Tabela chunks ou chunks_fts ainda não existem
 
@@ -142,7 +142,23 @@ def init_db(db):
                ("last_reindex", now))
 
     db.commit()
-    print("Schema criado/verificado com sucesso.")
+    print("Schema created/verified successfully.")
+
+    # ── Category migration: translate legacy PT category names to EN ──
+    CATEGORY_MIGRATION = {
+        "geral": "general",
+        "infraestrutura": "infrastructure",
+        "projeto": "project",
+        "pesquisa": "research",
+        "decisao": "decision",
+        "correcao": "correction",
+    }
+    for old_cat, new_cat in CATEGORY_MIGRATION.items():
+        db.execute("UPDATE memories SET category = ? WHERE category = ?", (new_cat, old_cat))
+    changed = db.execute("SELECT changes()").fetchone()[0]
+    if changed > 0:
+        print(f"Category migration: {changed} memories updated.")
+    db.commit()
 
 
 def iso_now():
@@ -158,7 +174,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-# Redirecionar stderr temporariamente durante import do embedder
+# Temporarily redirect stderr during embedder import
 import sys as _sys
 import io as _io
 _old_stderr = _sys.stderr
@@ -173,7 +189,7 @@ finally:
 _MODEL_INSTANCE = None
 
 def _get_model():
-    """Retorna instância singleton do GraniteONNXEmbedder."""
+    """Return singleton instance of GraniteONNXEmbedder."""
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
         _MODEL_INSTANCE = GraniteONNXEmbedder()
@@ -181,27 +197,27 @@ def _get_model():
 
 
 def embed_texts(texts):
-    """Gera embeddings para uma lista de textos usando Granite-97m ONNX int8."""
+    """Generate embeddings for a list of texts using Granite-97m ONNX int8."""
     model = _get_model()
     return model.encode(texts, normalize_embeddings=True)
 
 
 def embedding_to_blob(embedding):
-    """Converte lista de floats para BLOB (float32 little-endian)."""
+    """Convert a list of floats to a BLOB (float32 little-endian)."""
     if hasattr(embedding, 'tolist'):
         embedding = embedding.tolist()
     return struct.pack(f"<{len(embedding)}f", *embedding)
 
 
 def vec_embedding(emb_list):
-    """Converte lista de floats para JSON string aceito pelo sqlite-vec."""
+    """Convert a list of floats to a JSON string accepted by sqlite-vec."""
     if hasattr(emb_list, 'tolist'):
         emb_list = emb_list.tolist()
     return json.dumps(emb_list)
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Divide texto longo em chunks com overlap."""
+    """Split long text into chunks with overlap."""
     if len(text) <= size:
         return [(0, text)]
 
@@ -222,7 +238,7 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 # ── FTS5 sync helpers ─────────────────────────────────────────────────────────
 
 def _fts5_insert(db, chunk_id, chunk_text_content):
-    """Sincroniza FTS5 após inserir um chunk."""
+    """Sync FTS5 index after inserting a chunk."""
     try:
         db.execute(
             "INSERT INTO chunks_fts(rowid, chunk_text) VALUES (?, ?)",
@@ -233,7 +249,7 @@ def _fts5_insert(db, chunk_id, chunk_text_content):
 
 
 def _fts5_delete(db, chunk_id):
-    """Remove entrada do índice FTS5."""
+    """Remove an entry from the FTS5 index."""
     try:
         db.execute(
             "INSERT INTO chunks_fts(chunks_fts, rowid) VALUES('delete', ?)",
@@ -244,7 +260,7 @@ def _fts5_delete(db, chunk_id):
 
 
 def _fts5_rebuild(db):
-    """Reconstrói completo o índice FTS5 a partir da tabela chunks."""
+    """Rebuild the entire FTS5 index from the chunks table."""
     try:
         db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     except sqlite3.OperationalError:
@@ -253,17 +269,17 @@ def _fts5_rebuild(db):
 
 def search_fts(db, query, top_k=5, category=None):
     """
-    Busca lexical via FTS5 com ranking BM25.
-    Retorna lista de dicts com memory_id, chunk_text, title, category, bm25_score.
-    Se a query FTS5 falhar (syntax error), faz fallback para LIKE.
+    Lexical search via FTS5 with BM25 ranking.
+    Returns a list of dicts with memory_id, chunk_text, title, category, bm25_score.
+    Falls back to LIKE if the FTS5 query fails (syntax error).
     """
-    # Preparar query para FTS5: separar palavras, limpar, quote tokens especiais
+    # Prepare query for FTS5: split words, clean, quote special tokens
     words = []
     for w in query.split():
         w = w.strip().strip(".,;:!?()[]{}""'")
         if len(w) < 2:
             continue
-        # Tokens com caracteres especiais precisam de aspas duplas no FTS5
+        # Tokens with special characters need double quotes in FTS5
         if any(c in w for c in ":-_.@/\\"):
             words.append(f'"{w}"')
         else:
@@ -297,7 +313,7 @@ def search_fts(db, query, top_k=5, category=None):
         results = db.execute(sql, params).fetchall()
         return [dict(r) for r in results]
     except sqlite3.OperationalError:
-        # FTS5 query syntax error — fallback para LIKE
+        # FTS5 query syntax error — fallback to LIKE
         like_query = "%" + query.replace("%", "%%").replace("_", "\\_") + "%"
         fb_sql = """
             SELECT c.memory_id, c.chunk_text, m.title, m.category, 0 as bm25_score
@@ -318,14 +334,14 @@ def search_fts(db, query, top_k=5, category=None):
 
 def hybrid_search(db, query, top_k=5, category=None):
     """
-    Busca híbrida: semântica (sqlite-vec) + lexical (FTS5/BM25) com RRF merge.
-    Retorna lista de dicts ordenada por RRF score descendente,
-    cada dict com: memory_id, title, category, chunk_text, content,
+    Hybrid search: semantic (sqlite-vec) + lexical (FTS5/BM25) with RRF merge.
+    Returns a list of dicts ordered by descending RRF score,
+    each dict with: memory_id, title, category, chunk_text, content,
     semantic_similarity, rrf_score.
     """
     overfetch = top_k * 3
 
-    # ── 1. Busca semântica (sqlite-vec) ──
+    # ── 1. Semantic search (sqlite-vec) ──
     query_emb = embed_texts([query])[0]
     vec_sql = """
         SELECT
@@ -346,7 +362,7 @@ def hybrid_search(db, query, top_k=5, category=None):
     vec_sql += " ORDER BY vec.distance ASC"
     vec_results = db.execute(vec_sql, vec_params).fetchall()
 
-    # ── 2. Busca lexical (FTS5 / BM25) ──
+    # ── 2. Lexical search (FTS5 / BM25) ──
     fts_results = search_fts(db, query, top_k, category)
 
     # ── 3. RRF Merge (Reciprocal Rank Fusion) ──
@@ -377,7 +393,7 @@ def hybrid_search(db, query, top_k=5, category=None):
     for rank, r in enumerate(fts_results):
         mid = r["memory_id"]
         if mid not in merged:
-            # Resultado veio só do FTS5 — buscar metadata completo
+            # Result came only from FTS5 — fetch full metadata
             full = db.execute(
                 "SELECT content, tags, updated_at FROM memories WHERE id = ?",
                 (mid,)
@@ -400,18 +416,18 @@ def hybrid_search(db, query, top_k=5, category=None):
     return ranked
 
 
-def add_memory(db, title, content, category="geral", tags="", source="labo"):
-    """Adiciona uma memória com chunks e embeddings."""
+def add_memory(db, title, content, category="general", tags="", source="labo"):
+    """Add a memory entry with chunks and embeddings."""
     now = iso_now()
 
-    # Inserir memória
+    # Insert memory
     cur = db.execute(
         "INSERT INTO memories (title, category, content, tags, status, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (title, category, content, tags, "ativa", source, now, now)
     )
     memory_id = cur.lastrowid
 
-    # Gerar chunks e embeddings
+    # Generate chunks and embeddings
     chunks = chunk_text(content)
     if chunks:
         texts = [c[1] for c in chunks]
@@ -419,66 +435,66 @@ def add_memory(db, title, content, category="geral", tags="", source="labo"):
 
         for (chunk_idx, chunk_text_content), emb in zip(chunks, embeddings):
             blob = embedding_to_blob(emb)
-            # Inserir chunk na tabela chunks
+            # Insert chunk into chunks table
             chunk_cur = db.execute(
                 "INSERT INTO chunks (memory_id, chunk_index, chunk_text, embedding) VALUES (?, ?, ?, ?)",
                 (memory_id, chunk_idx, chunk_text_content, blob)
             )
             chunk_id = chunk_cur.lastrowid
-            # Inserir no índice vetorial
+            # Insert into vector index
             db.execute(
                 "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                 (chunk_id, vec_embedding(emb))
             )
-            # Sincronizar FTS5
+            # Sync FTS5
             _fts5_insert(db, chunk_id, chunk_text_content)
 
     db.commit()
-    print(f"Memória adicionada: id={memory_id}, title='{title}', category='{category}', chunks={len(chunks)}")
+    print(f"Memory added: id={memory_id}, title='{title}', category='{category}', chunks={len(chunks)}")
     return memory_id
 
 
 def search_memory(db, query, top_k=5, category=None):
-    """Busca híbrida: semântica + lexical (FTS5/BM25) com RRF merge. CLI-friendly."""
+    """Hybrid search: semantic + lexical (FTS5/BM25) with RRF merge. CLI-friendly output."""
     results = hybrid_search(db, query, top_k, category)
 
     if not results:
-        print("Nenhuma memória relevante encontrada.")
+        print("No relevant memories found.")
         return
 
     for i, r in enumerate(results, 1):
         sim = r.get("semantic_similarity", 0)
         rrf = r.get("rrf_score", 0)
-        print(f"\n--- Resultado {i} (RRF: {rrf:.4f} | cos: {sim:.3f}) ---")
-        print(f"ID: {r['memory_id']} | Título: {r['title']}")
-        print(f"Categoria: {r['category']} | Tags: {r.get('tags', '')}")
-        print(f"Trecho: {r['chunk_text'][:300]}...")
+        print(f"\n--- Result {i} (RRF: {rrf:.4f} | cos: {sim:.3f}) ---")
+        print(f"ID: {r['memory_id']} | Title: {r['title']}")
+        print(f"Category: {r['category']} | Tags: {r.get('tags', '')}")
+        print(f"Snippet: {r['chunk_text'][:300]}...")
         if r.get("content") and sim > 0.5:
-            print(f"\n[CONTEÚDO]:\n{r['content']}")
+            print(f"\n[CONTENT]:\n{r['content']}")
 
 
 def get_memory(db, memory_id):
-    """Recupera uma memória completa por ID."""
+    """Retrieve a complete memory entry by ID."""
     row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
     if not row:
-        print(f"Memória id={memory_id} não encontrada.")
+        print(f"Memory id={memory_id} not found.")
         return
     print(f"\nID: {row['id']}")
-    print(f"Título: {row['title']}")
-    print(f"Categoria: {row['category']}")
+    print(f"Title: {row['title']}")
+    print(f"Category: {row['category']}")
     print(f"Tags: {row['tags']}")
     print(f"Status: {row['status']}")
-    print(f"Fonte: {row['source']}")
-    print(f"Criado: {row['created_at']}")
-    print(f"Atualizado: {row['updated_at']}")
-    print(f"\nConteúdo:\n{row['content']}")
+    print(f"Source: {row['source']}")
+    print(f"Created: {row['created_at']}")
+    print(f"Updated: {row['updated_at']}")
+    print(f"\nContent:\n{row['content']}")
 
 
 def update_memory(db, memory_id, title=None, content=None, category=None, tags=None, status=None):
-    """Atualiza uma memória existente."""
+    """Update an existing memory entry."""
     row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
     if not row:
-        print(f"Memória id={memory_id} não encontrada.")
+        print(f"Memory id={memory_id} not found.")
         return
 
     now = iso_now()
@@ -493,16 +509,16 @@ def update_memory(db, memory_id, title=None, content=None, category=None, tags=N
         WHERE id=?
     """, (new_title, new_category, new_tags, new_status, new_content, now, memory_id))
 
-    # Se conteúdo mudou, reindexar chunks
+    # If content changed, reindex chunks
     if content and content != row["content"]:
-        # Remover chunks antigos (incluindo FTS5)
+        # Remove old chunks (including FTS5)
         chunk_ids = db.execute("SELECT id FROM chunks WHERE memory_id = ?", (memory_id,)).fetchall()
         for cid in chunk_ids:
             db.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid[0],))
             _fts5_delete(db, cid[0])
         db.execute("DELETE FROM chunks WHERE memory_id = ?", (memory_id,))
 
-        # Criar novos chunks
+        # Create new chunks
         chunks = chunk_text(content)
         if chunks:
             texts = [c[1] for c in chunks]
@@ -521,11 +537,11 @@ def update_memory(db, memory_id, title=None, content=None, category=None, tags=N
                 _fts5_insert(db, chunk_id, chunk_text_content)
 
     db.commit()
-    print(f"Memória id={memory_id} atualizada.")
+    print(f"Memory id={memory_id} updated.")
 
 
 def delete_memory(db, memory_id):
-    """Remove uma memória e seus chunks."""
+    """Remove a memory entry and its chunks."""
     chunk_ids = db.execute("SELECT id FROM chunks WHERE memory_id = ?", (memory_id,)).fetchall()
     for cid in chunk_ids:
         db.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid[0],))
@@ -533,11 +549,11 @@ def delete_memory(db, memory_id):
     db.execute("DELETE FROM chunks WHERE memory_id = ?", (memory_id,))
     db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     db.commit()
-    print(f"Memória id={memory_id} removida.")
+    print(f"Memory id={memory_id} removed.")
 
 
 def list_memories(db, category=None, status="ativa", limit=50):
-    """Lista memórias com filtros."""
+    """List memories with filters."""
     sql = "SELECT id, title, category, tags, status, updated_at FROM memories WHERE 1=1"
     params = []
     if category:
@@ -551,20 +567,20 @@ def list_memories(db, category=None, status="ativa", limit=50):
 
     rows = db.execute(sql, params).fetchall()
     if not rows:
-        print("Nenhuma memória encontrada.")
+        print("No memories found.")
         return
 
-    print(f"{'ID':<5} {'Categoria':<15} {'Status':<10} {'Atualizado':<20} {'Título'}")
+    print(f"{'ID':<5} {'Category':<15} {'Status':<10} {'Updated':<20} {'Title'}")
     print("-" * 90)
     for r in rows:
         print(f"{r['id']:<5} {r['category']:<15} {r['status']:<10} {r['updated_at'][:16]:<20} {r['title']}")
 
 
 def import_vault(db, vault_path):
-    """Importa notas .md do Obsidian Vault para o SQLite."""
+    """Import .md notes from Obsidian Vault into SQLite."""
     vault = os.path.expanduser(vault_path)
     if not os.path.isdir(vault):
-        print(f"Diretório não encontrado: {vault}")
+        print(f"Directory not found: {vault}")
         return
 
     md_files = glob.glob(os.path.join(vault, "**", "*.md"), recursive=True)
@@ -582,27 +598,27 @@ def import_vault(db, vault_path):
             skipped += 1
             continue
 
-        # Detectar categoria pelo nome
-        category = "geral"
-        if "Infraestrutura" in filename:
-            category = "infraestrutura"
-        elif "Pesquisa" in filename:
-            category = "pesquisa"
-        elif "Projeto" in filename or "Projetos" in filename:
-            category = "projeto"
+        # Detect category by filename (supports PT and EN naming)
+        category = "general"
+        if any(kw in filename for kw in ["Infraestrutura", "Infrastructure", "Infra", "Server", "Deploy"]):
+            category = "infrastructure"
+        elif any(kw in filename for kw in ["Pesquisa", "Research", "Study", "Library"]):
+            category = "research"
+        elif any(kw in filename for kw in ["Projeto", "Projetos", "Project", "App", "Feature"]):
+            category = "project"
         elif "Config" in filename:
             category = "config"
-        elif "Decis" in filename:
-            category = "decisao"
-        elif "Memória" in filename or "Memoria" in filename:
+        elif any(kw in filename for kw in ["Decis", "Decision", "Decisão", "Trade-off"]):
+            category = "decision"
+        elif any(kw in filename for kw in ["Memória", "Memoria", "Memory", "Meta"]):
             category = "meta"
         elif "Trading" in filename:
-            category = "projeto"
+            category = "project"
 
-        # Verificar se já existe (dedup por título)
+        # Check if already exists (dedup by title)
         existing = db.execute("SELECT id FROM memories WHERE title = ?", (filename,)).fetchone()
         if existing:
-            print(f"  SKIP (já existe): {filename}")
+            print(f"  SKIP (already exists): {filename}")
             skipped += 1
             continue
 
@@ -611,14 +627,14 @@ def import_vault(db, vault_path):
             imported += 1
             print(f"  OK: {filename}")
         except Exception as e:
-            print(f"  ERRO: {filename} — {e}")
+            print(f"  ERROR: {filename} — {e}")
             skipped += 1
 
-    print(f"\nImportação concluída: {imported} importadas, {skipped} puladas.")
+    print(f"\nImport complete: {imported} imported, {skipped} skipped.")
 
 
 def backup_db(db):
-    """Dump completo do banco em SQL texto para stdout."""
+    """Dump the complete database as SQL text to stdout."""
     import io
     output = io.StringIO()
     for line in db.iterdump():
@@ -627,7 +643,7 @@ def backup_db(db):
 
 
 def stats_db(db):
-    """Mostra estatísticas do banco."""
+    """Show database statistics."""
     mem_count = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
     chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     vec_count = db.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0]
@@ -635,22 +651,22 @@ def stats_db(db):
     model = db.execute("SELECT value FROM metadata WHERE key = 'model'").fetchone()
     db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
 
-    print(f"Banco: {DB_PATH}")
-    print(f"Tamanho: {db_size / 1024:.1f} KB")
-    print(f"Modelo: {model[0] if model else 'N/A'}")
-    print(f"Memórias: {mem_count}")
+    print(f"Database: {DB_PATH}")
+    print(f"Size: {db_size / 1024:.1f} KB")
+    print(f"Model: {model[0] if model else 'N/A'}")
+    print(f"Memories: {mem_count}")
     print(f"Chunks: {chunk_count}")
-    print(f"Vetores indexados: {vec_count}")
-    print(f"\nPor categoria:")
+    print(f"Indexed vectors: {vec_count}")
+    print(f"\nBy category:")
     for cat, count in categories:
         print(f"  {cat}: {count}")
 
 
 def reindex_all(db):
-    """Reindexa todos os embeddings do zero."""
-    print("Reindexando todos os embeddings...")
+    """Reindex all embeddings from scratch."""
+    print("Reindexing all embeddings...")
 
-    # Garantir que o schema FTS5 existe
+    # Ensure FTS5 schema exists
     try:
         db.executescript("""
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -662,10 +678,10 @@ def reindex_all(db):
     except sqlite3.OperationalError:
         pass
 
-    # Limpar índice vetorial
+    # Clear vector index
     db.execute("DELETE FROM vec_chunks")
 
-    # Recriar tabela virtual (mais seguro)
+    # Recreate virtual table (safer)
     db.execute("DROP TABLE IF EXISTS vec_chunks")
     db.execute(f"""
         CREATE VIRTUAL TABLE vec_chunks
@@ -675,11 +691,11 @@ def reindex_all(db):
         )
     """)
 
-    # Regenerar chunks e embeddings para cada memória
+    # Regenerate chunks and embeddings for each memory
     memories = db.execute("SELECT id, content FROM memories WHERE status = 'ativa'").fetchall()
     total = len(memories)
 
-    # Limpar chunks existentes
+    # Clear existing chunks
     db.execute("DELETE FROM chunks")
 
     for i, mem in enumerate(memories):
@@ -704,17 +720,17 @@ def reindex_all(db):
                 )
 
         if (i + 1) % 10 == 0 or i == total - 1:
-            print(f"  {i + 1}/{total} memórias reindexadas")
+            print(f"  {i + 1}/{total} memories reindexed")
 
-    # Reconstruir índice FTS5
+    # Rebuild FTS5 index
     _fts5_rebuild(db)
-    print("Índice FTS5 reconstruído.")
+    print("FTS5 index rebuilt.")
 
     now = iso_now()
     db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
                ("last_reindex", now))
     db.commit()
-    print(f"Reindexação concluída: {total} memórias.")
+    print(f"Reindex complete: {total} memories.")
 
 
 def main():
@@ -722,57 +738,57 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # init
-    sub.add_parser("init", help="Criar schema do banco")
+    sub.add_parser("init", help="Create DB schema")
 
     # add
-    p_add = sub.add_parser("add", help="Adicionar memória")
-    p_add.add_argument("title", help="Título da memória")
-    p_add.add_argument("content", help="Conteúdo da memória")
-    p_add.add_argument("--category", default="geral", help="Categoria")
-    p_add.add_argument("--tags", default="", help="Tags separadas por vírgula")
-    p_add.add_argument("--source", default="labo", help="Fonte da memória")
+    p_add = sub.add_parser("add", help="Add memory")
+    p_add.add_argument("title", help="Memory title")
+    p_add.add_argument("content", help="Memory content")
+    p_add.add_argument("--category", default="general", help="Category")
+    p_add.add_argument("--tags", default="", help="Comma-separated tags")
+    p_add.add_argument("--source", default="labo", help="Memory source")
 
     # search
-    p_search = sub.add_parser("search", help="Busca semântica")
-    p_search.add_argument("query", help="Pergunta ou tema para buscar")
-    p_search.add_argument("--top_k", type=int, default=5, help="Número de resultados")
-    p_search.add_argument("--category", default=None, help="Filtrar por categoria")
+    p_search = sub.add_parser("search", help="Semantic search")
+    p_search.add_argument("query", help="Query topic to search for")
+    p_search.add_argument("--top_k", type=int, default=5, help="Number of results")
+    p_search.add_argument("--category", default=None, help="Filter by category")
 
     # get
-    p_get = sub.add_parser("get", help="Recuperar memória por ID")
-    p_get.add_argument("id", type=int, help="ID da memória")
+    p_get = sub.add_parser("get", help="Retrieve memory by ID")
+    p_get.add_argument("id", type=int, help="Memory ID")
 
     # update
-    p_update = sub.add_parser("update", help="Atualizar memória")
-    p_update.add_argument("id", type=int, help="ID da memória")
-    p_update.add_argument("--title", default=None, help="Novo título")
-    p_update.add_argument("--content", default=None, help="Novo conteúdo")
-    p_update.add_argument("--category", default=None, help="Nova categoria")
-    p_update.add_argument("--tags", default=None, help="Novas tags")
-    p_update.add_argument("--status", default=None, help="Novo status")
+    p_update = sub.add_parser("update", help="Update memory")
+    p_update.add_argument("id", type=int, help="Memory ID")
+    p_update.add_argument("--title", default=None, help="New title")
+    p_update.add_argument("--content", default=None, help="New content")
+    p_update.add_argument("--category", default=None, help="New category")
+    p_update.add_argument("--tags", default=None, help="New tags")
+    p_update.add_argument("--status", default=None, help="New status")
 
     # delete
-    p_del = sub.add_parser("delete", help="Remover memória")
-    p_del.add_argument("id", type=int, help="ID da memória")
+    p_del = sub.add_parser("delete", help="Remove memory")
+    p_del.add_argument("id", type=int, help="Memory ID")
 
     # list
-    p_list = sub.add_parser("list", help="Listar memórias")
-    p_list.add_argument("--category", default=None, help="Filtrar por categoria")
-    p_list.add_argument("--status", default="ativa", help="Filtrar por status")
-    p_list.add_argument("--limit", type=int, default=50, help="Limite de resultados")
+    p_list = sub.add_parser("list", help="List memories")
+    p_list.add_argument("--category", default=None, help="Filter by category")
+    p_list.add_argument("--status", default="ativa", help="Filter by status")
+    p_list.add_argument("--limit", type=int, default=50, help="Result limit")
 
     # import-vault
-    p_import = sub.add_parser("import-vault", help="Importar notas do Obsidian")
-    p_import.add_argument("path", help="Caminho do Vault")
+    p_import = sub.add_parser("import-vault", help="Import notes from Obsidian")
+    p_import.add_argument("path", help="Vault path")
 
     # backup
-    sub.add_parser("backup", help="Dump SQL para stdout")
+    sub.add_parser("backup", help="SQL dump to stdout")
 
     # stats
-    sub.add_parser("stats", help="Estatísticas do banco")
+    sub.add_parser("stats", help="Database statistics")
 
     # reindex
-    sub.add_parser("reindex", help="Reindexar todos os embeddings")
+    sub.add_parser("reindex", help="Reindex all embeddings")
 
     args = parser.parse_args()
 
