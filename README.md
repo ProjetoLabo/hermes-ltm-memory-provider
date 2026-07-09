@@ -138,8 +138,8 @@ ltm-memory-provider/
 ├── README.md                       ← this guide
 ├── src/
 │   ├── granite_embedder.py         ONNX model wrapper (68 lines)
-│   ├── query_memory.py             SQLite DB + embedding + FTS5/BM25 + hybrid search (822 lines)
-│   ├── ltm_manager.py              High-level search/export/classify (625 lines)
+│   ├── query_memory.py             SQLite DB + embedding + FTS5/BM25 + hybrid search (838 lines)
+│   ├── ltm_manager.py              High-level search/export/classify (635 lines)
 │   └── ltm_ops.py                  Subprocess bridge (261 lines)
 └── plugins/
     └── ltm/
@@ -887,7 +887,7 @@ class GraniteONNXEmbedder:
         return pooled.tolist()
 ```
 
-### A2: `query_memory.py` (822 lines)
+### A2: `query_memory.py` (838 lines)
 
 **Source:** `src/query_memory.py` in this repository.
 
@@ -908,7 +908,7 @@ Comprehensive file that provides:
 - Auto-migration: legacy PT category names → EN on startup
 - CLI parser for standalone use
 
-### A3: `ltm_manager.py` (625 lines)
+### A3: `ltm_manager.py` (635 lines)
 
 **Source:** `src/ltm_manager.py` in this repository.
 

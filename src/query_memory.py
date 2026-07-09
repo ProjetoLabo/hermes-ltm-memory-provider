@@ -128,9 +128,9 @@ def init_db(db):
             _fts5_rebuild(db)
             print("FTS5 index rebuilt successfully.")
     except sqlite3.OperationalError:
-        pass  # Tabela chunks ou chunks_fts ainda não existem
+        pass  # chunks or chunks_fts table may not exist yet
 
-    # Registrar metadata
+    # Register metadata
     now = iso_now()
     db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
                ("model", MODEL_NAME))
@@ -366,7 +366,7 @@ def hybrid_search(db, query, top_k=5, category=None):
     fts_results = search_fts(db, query, top_k, category)
 
     # ── 3. RRF Merge (Reciprocal Rank Fusion) ──
-    K = 60  # Constante RRF padrão
+    K = 60  # Standard RRF constant
     merged = {}  # memory_id -> entry
 
     for rank, r in enumerate(vec_results):
@@ -385,7 +385,7 @@ def hybrid_search(db, query, top_k=5, category=None):
                 "rrf_score": 0.0,
             }
         else:
-            # Atualizar similaridade semântica se este chunk for melhor
+            # Update semantic similarity if this chunk is better
             if sim > merged[mid]["semantic_similarity"]:
                 merged[mid]["semantic_similarity"] = sim
         merged[mid]["rrf_score"] += 1.0 / (rank + K)
