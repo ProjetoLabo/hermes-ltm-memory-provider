@@ -745,6 +745,21 @@ When installation completes, deliver this to the user:
 
 ## Troubleshooting
 
+### Upgrading from v1.1.1 to v1.1.2 (Hybrid Search)
+
+This version adds full-text search (FTS5/BM25) alongside semantic search.
+
+**Migration is automatic.** On first startup after upgrading code files:
+1. `init_db()` creates the new `chunks_fts` virtual table
+2. Detects existing chunks without FTS5 index
+3. Rebuilds the FTS5 index automatically
+
+**No manual reindex needed.** If your SQLite build lacks FTS5 support, the
+system degrades gracefully — search falls back to the previous semantic-only
+behavior without errors.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for full details.
+
 ### Plugin not discovered
 
 **Check:**

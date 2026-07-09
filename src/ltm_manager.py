@@ -33,6 +33,7 @@ from query_memory import (
     get_db, init_db, embed_texts, chunk_text,
     embedding_to_blob, vec_embedding, iso_now,
     add_memory, search_memory as _search_memory,
+    hybrid_search,
     get_memory, update_memory, delete_memory, list_memories,
     stats_db
 )
@@ -204,73 +205,36 @@ def generate_title(text, target="memory"):
 
 def query_context(topic, top_k=5, category=None):
     """
-    Busca semântica e retorna JSON com contexto relevante.
+    Busca híbrida (semântica + lexical FTS5/BM25) e retorna JSON com contexto.
     Usado pelo Hermes para injetar contexto no prompt.
     """
     db = get_db()
 
     try:
-        query_emb = embed_texts([topic])[0]
+        results = hybrid_search(db, topic, top_k, category)
     except Exception as e:
         db.close()
-        return json.dumps({"error": f"Erro gerando embedding: {e}"})
+        return json.dumps({"error": f"Erro na busca híbrida: {e}"})
 
-    k = top_k * 3  # Buscar mais para deduplicar
-    sql = """
-    SELECT
-        vec.distance,
-        c.memory_id,
-        c.chunk_text,
-        m.title,
-        m.category,
-        m.tags,
-        m.content,
-        m.updated_at
-    FROM vec_chunks vec
-    JOIN chunks c ON vec.chunk_id = c.id
-    JOIN memories m ON c.memory_id = m.id
-    WHERE m.status = 'ativa'
-    AND vec.embedding MATCH ?
-    AND k = ?
-    """
-    params = [vec_embedding(query_emb), k]
-
-    if category:
-        sql += " AND m.category = ?"
-        params.append(category)
-
-    sql += " ORDER BY vec.distance ASC"
-
-    try:
-        results = db.execute(sql, params).fetchall()
-    except Exception as e:
-        db.close()
-        return json.dumps({"error": f"Erro na busca: {e}"})
-
-    # Deduplicar por memory_id
-    seen = set()
     context_entries = []
     for r in results:
-        mid = r["memory_id"]
-        if mid in seen:
-            continue
-        seen.add(mid)
+        sim = r.get("semantic_similarity", 0)
+        rrf = r.get("rrf_score", 0)
 
-        # Converter distância euclidiana para similaridade de cosseno
-        # Para vetores normalizados: cosine_sim = 1 - distance² / 2
-        similarity = 1 - (r["distance"] ** 2) / 2
-        if similarity < 0.30:  # Threshold ajustado para similaridade de cosseno
+        # Threshold menos restritivo para resultados que vieram do FTS5
+        if sim < 0.30 and rrf < 0.008:
             continue
 
         context_entries.append({
-            "id": mid,
+            "id": r["memory_id"],
             "title": r["title"],
             "category": r["category"],
-            "tags": r["tags"],
-            "similarity": round(similarity, 3),
-            "updated": r["updated_at"],
-            "relevant_chunk": r["chunk_text"][:500],
-            "full_content": r["content"] if similarity > 0.45 else None,
+            "tags": r.get("tags", ""),
+            "similarity": round(sim, 3),
+            "rrf_score": round(rrf, 4),
+            "updated": r.get("updated", ""),
+            "relevant_chunk": r.get("chunk_text", "")[:500],
+            "full_content": r.get("content") if sim > 0.45 else None,
         })
 
         if len(context_entries) >= top_k:

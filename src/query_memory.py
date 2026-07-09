@@ -105,8 +105,30 @@ def init_db(db):
             )
         """)
     except sqlite3.OperationalError:
-        # Tabela já existe
         pass
+
+    # Criar índice FTS5 para busca lexical (BM25)
+    try:
+        db.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                chunk_text,
+                content='chunks',
+                content_rowid='id'
+            );
+        """)
+    except sqlite3.OperationalError:
+        pass
+
+    # Migração one-time: se existem chunks mas FTS5 está vazio, reconstruir
+    try:
+        chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        fts_count = db.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        if chunk_count > 0 and fts_count == 0:
+            print(f"Migração FTS5: {chunk_count} chunks encontrados, reconstruindo índice...")
+            _fts5_rebuild(db)
+            print("Índice FTS5 reconstruído com sucesso.")
+    except sqlite3.OperationalError:
+        pass  # Tabela chunks ou chunks_fts ainda não existem
 
     # Registrar metadata
     now = iso_now()
@@ -197,6 +219,187 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 
+# ── FTS5 sync helpers ─────────────────────────────────────────────────────────
+
+def _fts5_insert(db, chunk_id, chunk_text_content):
+    """Sincroniza FTS5 após inserir um chunk."""
+    try:
+        db.execute(
+            "INSERT INTO chunks_fts(rowid, chunk_text) VALUES (?, ?)",
+            (chunk_id, chunk_text_content)
+        )
+    except sqlite3.OperationalError:
+        pass  # FTS5 table may not exist during testing
+
+
+def _fts5_delete(db, chunk_id):
+    """Remove entrada do índice FTS5."""
+    try:
+        db.execute(
+            "INSERT INTO chunks_fts(chunks_fts, rowid) VALUES('delete', ?)",
+            (chunk_id,)
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _fts5_rebuild(db):
+    """Reconstrói completo o índice FTS5 a partir da tabela chunks."""
+    try:
+        db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    except sqlite3.OperationalError:
+        pass
+
+
+def search_fts(db, query, top_k=5, category=None):
+    """
+    Busca lexical via FTS5 com ranking BM25.
+    Retorna lista de dicts com memory_id, chunk_text, title, category, bm25_score.
+    Se a query FTS5 falhar (syntax error), faz fallback para LIKE.
+    """
+    # Preparar query para FTS5: separar palavras, limpar, quote tokens especiais
+    words = []
+    for w in query.split():
+        w = w.strip().strip(".,;:!?()[]{}""'")
+        if len(w) < 2:
+            continue
+        # Tokens com caracteres especiais precisam de aspas duplas no FTS5
+        if any(c in w for c in ":-_.@/\\"):
+            words.append(f'"{w}"')
+        else:
+            words.append(w)
+
+    fts_query = " AND ".join(words) if words else ""
+    if not fts_query:
+        return []
+
+    sql = """
+        SELECT
+            c.memory_id,
+            c.chunk_text,
+            m.title,
+            m.category,
+            rank as bm25_score
+        FROM chunks_fts
+        JOIN chunks c ON chunks_fts.rowid = c.id
+        JOIN memories m ON c.memory_id = m.id
+        WHERE chunks_fts MATCH ?
+          AND m.status = 'ativa'
+    """
+    params = [fts_query]
+    if category:
+        sql += " AND m.category = ?"
+        params.append(category)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(top_k * 2)
+
+    try:
+        results = db.execute(sql, params).fetchall()
+        return [dict(r) for r in results]
+    except sqlite3.OperationalError:
+        # FTS5 query syntax error — fallback para LIKE
+        like_query = "%" + query.replace("%", "%%").replace("_", "\\_") + "%"
+        fb_sql = """
+            SELECT c.memory_id, c.chunk_text, m.title, m.category, 0 as bm25_score
+            FROM chunks c
+            JOIN memories m ON c.memory_id = m.id
+            WHERE c.chunk_text LIKE ?
+              AND m.status = 'ativa'
+        """
+        fb_params = [like_query]
+        if category:
+            fb_sql += " AND m.category = ?"
+            fb_params.append(category)
+        fb_sql += " LIMIT ?"
+        fb_params.append(top_k * 2)
+        results = db.execute(fb_sql, fb_params).fetchall()
+        return [dict(r) for r in results]
+
+
+def hybrid_search(db, query, top_k=5, category=None):
+    """
+    Busca híbrida: semântica (sqlite-vec) + lexical (FTS5/BM25) com RRF merge.
+    Retorna lista de dicts ordenada por RRF score descendente,
+    cada dict com: memory_id, title, category, chunk_text, content,
+    semantic_similarity, rrf_score.
+    """
+    overfetch = top_k * 3
+
+    # ── 1. Busca semântica (sqlite-vec) ──
+    query_emb = embed_texts([query])[0]
+    vec_sql = """
+        SELECT
+            vec.chunk_id, vec.distance,
+            c.memory_id, c.chunk_text,
+            m.title, m.category, m.tags, m.content, m.updated_at
+        FROM vec_chunks vec
+        JOIN chunks c ON vec.chunk_id = c.id
+        JOIN memories m ON c.memory_id = m.id
+        WHERE m.status = 'ativa'
+          AND vec.embedding MATCH ?
+          AND k = ?
+    """
+    vec_params = [vec_embedding(query_emb), overfetch]
+    if category:
+        vec_sql += " AND m.category = ?"
+        vec_params.append(category)
+    vec_sql += " ORDER BY vec.distance ASC"
+    vec_results = db.execute(vec_sql, vec_params).fetchall()
+
+    # ── 2. Busca lexical (FTS5 / BM25) ──
+    fts_results = search_fts(db, query, top_k, category)
+
+    # ── 3. RRF Merge (Reciprocal Rank Fusion) ──
+    K = 60  # Constante RRF padrão
+    merged = {}  # memory_id -> entry
+
+    for rank, r in enumerate(vec_results):
+        mid = r["memory_id"]
+        sim = 1 - (r["distance"] ** 2) / 2  # dist euclidiana -> cosseno
+        if mid not in merged:
+            merged[mid] = {
+                "memory_id": mid,
+                "chunk_text": r["chunk_text"],
+                "title": r["title"],
+                "category": r["category"],
+                "tags": r["tags"],
+                "content": r["content"],
+                "updated": r["updated_at"],
+                "semantic_similarity": sim,
+                "rrf_score": 0.0,
+            }
+        else:
+            # Atualizar similaridade semântica se este chunk for melhor
+            if sim > merged[mid]["semantic_similarity"]:
+                merged[mid]["semantic_similarity"] = sim
+        merged[mid]["rrf_score"] += 1.0 / (rank + K)
+
+    for rank, r in enumerate(fts_results):
+        mid = r["memory_id"]
+        if mid not in merged:
+            # Resultado veio só do FTS5 — buscar metadata completo
+            full = db.execute(
+                "SELECT content, tags, updated_at FROM memories WHERE id = ?",
+                (mid,)
+            ).fetchone()
+            merged[mid] = {
+                "memory_id": mid,
+                "chunk_text": r["chunk_text"],
+                "title": r["title"],
+                "category": r["category"],
+                "tags": full["tags"] if full else "",
+                "content": full["content"] if full else r["chunk_text"],
+                "updated": full["updated_at"] if full else "",
+                "semantic_similarity": 0.0,
+                "rrf_score": 0.0,
+            }
+        merged[mid]["rrf_score"] += 1.0 / (rank + K)
+
+    # Ordenar por RRF score descendente e limitar
+    ranked = sorted(merged.values(), key=lambda x: -x["rrf_score"])[:top_k]
+    return ranked
+
+
 def add_memory(db, title, content, category="geral", tags="", source="labo"):
     """Adiciona uma memória com chunks e embeddings."""
     now = iso_now()
@@ -227,6 +430,8 @@ def add_memory(db, title, content, category="geral", tags="", source="labo"):
                 "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                 (chunk_id, vec_embedding(emb))
             )
+            # Sincronizar FTS5
+            _fts5_insert(db, chunk_id, chunk_text_content)
 
     db.commit()
     print(f"Memória adicionada: id={memory_id}, title='{title}', category='{category}', chunks={len(chunks)}")
@@ -234,70 +439,22 @@ def add_memory(db, title, content, category="geral", tags="", source="labo"):
 
 
 def search_memory(db, query, top_k=5, category=None):
-    """Busca semântica por similaridade de cosseno."""
-    # Gerar embedding da query
-    query_emb = embed_texts([query])[0]
+    """Busca híbrida: semântica + lexical (FTS5/BM25) com RRF merge. CLI-friendly."""
+    results = hybrid_search(db, query, top_k, category)
 
-    # Buscar no índice vetorial (sqlite-vec usa MATCH + k para busca vetorial)
-    k = top_k * 2  # Buscar mais pra deduplicar por memory_id
-    sql = """
-        SELECT
-            vec.chunk_id,
-            vec.distance,
-            c.memory_id,
-            c.chunk_index,
-            c.chunk_text,
-            m.title,
-            m.category,
-            m.tags,
-            m.status,
-            m.updated_at
-        FROM vec_chunks vec
-        JOIN chunks c ON vec.chunk_id = c.id
-        JOIN memories m ON c.memory_id = m.id
-        WHERE m.status = 'ativa'
-          AND vec.embedding MATCH ?
-          AND k = ?
-    """
-    params = [vec_embedding(query_emb), k]
-
-    if category:
-        sql += " AND m.category = ?"
-        params.append(category)
-
-    sql += " ORDER BY vec.distance ASC"
-
-    results = db.execute(sql, params).fetchall()
-
-    # Deduplicar por memory_id (manter o chunk mais similar de cada memória)
-    seen = set()
-    unique_results = []
-    for r in results:
-        if r["memory_id"] not in seen:
-            seen.add(r["memory_id"])
-            unique_results.append(dict(r))
-        if len(unique_results) >= top_k:
-            break
-
-    # Imprimir resultados
-    if not unique_results:
+    if not results:
         print("Nenhuma memória relevante encontrada.")
         return
 
-    for i, r in enumerate(unique_results, 1):
-        # Converter distância euclidiana para similaridade de cosseno
-        # Para vetores normalizados: cosine_sim = 1 - distance² / 2
-        similarity = 1 - (r["distance"] ** 2) / 2
-        print(f"\n--- Resultado {i} (similaridade: {similarity:.3f}) ---")
+    for i, r in enumerate(results, 1):
+        sim = r.get("semantic_similarity", 0)
+        rrf = r.get("rrf_score", 0)
+        print(f"\n--- Resultado {i} (RRF: {rrf:.4f} | cos: {sim:.3f}) ---")
         print(f"ID: {r['memory_id']} | Título: {r['title']}")
-        print(f"Categoria: {r['category']} | Tags: {r['tags']}")
-        print(f"Atualizado: {r['updated_at']}")
+        print(f"Categoria: {r['category']} | Tags: {r.get('tags', '')}")
         print(f"Trecho: {r['chunk_text'][:300]}...")
-        if len(unique_results) == 1 or i <= top_k:
-            # Para contexto do agente: mostrar conteúdo completo
-            full = db.execute("SELECT content FROM memories WHERE id = ?", (r["memory_id"],)).fetchone()
-            if full and similarity > 0.5:
-                print(f"\n[CONTEÚDO COMPLETO]:\n{full['content']}")
+        if r.get("content") and sim > 0.5:
+            print(f"\n[CONTEÚDO]:\n{r['content']}")
 
 
 def get_memory(db, memory_id):
@@ -338,10 +495,11 @@ def update_memory(db, memory_id, title=None, content=None, category=None, tags=N
 
     # Se conteúdo mudou, reindexar chunks
     if content and content != row["content"]:
-        # Remover chunks antigos
+        # Remover chunks antigos (incluindo FTS5)
         chunk_ids = db.execute("SELECT id FROM chunks WHERE memory_id = ?", (memory_id,)).fetchall()
         for cid in chunk_ids:
             db.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid[0],))
+            _fts5_delete(db, cid[0])
         db.execute("DELETE FROM chunks WHERE memory_id = ?", (memory_id,))
 
         # Criar novos chunks
@@ -360,6 +518,7 @@ def update_memory(db, memory_id, title=None, content=None, category=None, tags=N
                     "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                     (chunk_id, vec_embedding(emb))
                 )
+                _fts5_insert(db, chunk_id, chunk_text_content)
 
     db.commit()
     print(f"Memória id={memory_id} atualizada.")
@@ -370,6 +529,7 @@ def delete_memory(db, memory_id):
     chunk_ids = db.execute("SELECT id FROM chunks WHERE memory_id = ?", (memory_id,)).fetchall()
     for cid in chunk_ids:
         db.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid[0],))
+        _fts5_delete(db, cid[0])
     db.execute("DELETE FROM chunks WHERE memory_id = ?", (memory_id,))
     db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     db.commit()
@@ -490,6 +650,18 @@ def reindex_all(db):
     """Reindexa todos os embeddings do zero."""
     print("Reindexando todos os embeddings...")
 
+    # Garantir que o schema FTS5 existe
+    try:
+        db.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                chunk_text,
+                content='chunks',
+                content_rowid='id'
+            );
+        """)
+    except sqlite3.OperationalError:
+        pass
+
     # Limpar índice vetorial
     db.execute("DELETE FROM vec_chunks")
 
@@ -533,6 +705,10 @@ def reindex_all(db):
 
         if (i + 1) % 10 == 0 or i == total - 1:
             print(f"  {i + 1}/{total} memórias reindexadas")
+
+    # Reconstruir índice FTS5
+    _fts5_rebuild(db)
+    print("Índice FTS5 reconstruído.")
 
     now = iso_now()
     db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
